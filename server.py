@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-PORT = 8000
+PORT = int(os.environ.get("PORT", 8000))
 DB_FILE = "safety.db"
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production-please")
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")
