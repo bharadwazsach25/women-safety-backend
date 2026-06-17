@@ -13,6 +13,8 @@ import hmac
 import base64
 import os
 import re
+import urllib.request
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
@@ -22,6 +24,7 @@ PORT = int(os.environ.get("PORT", 8000))
 DB_FILE = "safety.db"
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production-please")
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # ─── Database Setup ───────────────────────────────────────────────────────────
 def get_db():
@@ -387,20 +390,103 @@ def find_route(body, params, user):
         "alternate_available": True
     }
 
-# AI Detection (mock - integrate with vision API in production)
+# ─── Gemini Vision Helper ──────────────────────────────────────────────────
+def analyze_image_with_gemini(image_b64: str, mime_type: str = "image/jpeg"):
+    """Sends an image to Google Gemini Vision API and asks it to detect weapons/threats.
+    Returns a dict matching our app's expected detection format."""
+    if not GEMINI_API_KEY:
+        return {
+            "detected": False,
+            "object": "AI not configured",
+            "confidence": 0,
+            "threat_level": "UNKNOWN",
+            "recommended_action": "GEMINI_API_KEY environment variable is not set on the server.",
+            "note": "Add GEMINI_API_KEY in Render's Environment settings to enable real detection."
+        }
+
+    prompt = (
+        "You are a safety detection system. Look at this image carefully and determine if it shows "
+        "any weapon or dangerous object (knife, gun, blade, firearm, explosive, or similar threat to a person's safety). "
+        "Respond with ONLY a raw JSON object (no markdown, no code fences) in exactly this format: "
+        '{"object": "<name of the main object detected, e.g. Knife, Gun, No threat>", '
+        '"confidence": <integer 0-100>, '
+        '"threat_level": "<one of: HIGH, MEDIUM, LOW, SAFE>", '
+        '"recommended_action": "<one short sentence of safety advice based on what you see>"}'
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": image_b64}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200}
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            result = json.loads(resp.read().decode())
+
+        raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Gemini sometimes wraps JSON in ```json fences despite instructions - strip them
+        raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw_text)
+
+        threat_level = parsed.get("threat_level", "SAFE").upper()
+        return {
+            "detected": threat_level != "SAFE",
+            "object": parsed.get("object", "Unknown"),
+            "confidence": int(parsed.get("confidence", 0)),
+            "threat_level": threat_level,
+            "recommended_action": parsed.get("recommended_action", "Stay alert and trust your instincts."),
+        }
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"Gemini API HTTP error: {e.code} - {err_body}")
+        return {
+            "detected": False, "object": "Detection failed", "confidence": 0,
+            "threat_level": "UNKNOWN",
+            "recommended_action": "Could not reach AI service. Please try again.",
+            "note": f"API error {e.code}"
+        }
+    except Exception as e:
+        print(f"Gemini analysis error: {e}")
+        return {
+            "detected": False, "object": "Detection failed", "confidence": 0,
+            "threat_level": "UNKNOWN",
+            "recommended_action": "Could not analyze image. Please try again.",
+            "note": str(e)
+        }
+
+# AI Detection - powered by Google Gemini Vision
 @route("POST", "/api/detect")
 def ai_detect(body, params, user):
     if not user:
         return 401, {"error": "Unauthorized"}
-    # In production: send image to vision model (Gemini/GPT-4V/Claude)
-    return 200, {
-        "detected": True,
-        "object": "No threat detected",
-        "confidence": 98,
-        "threat_level": "SAFE",
-        "recommended_action": "Your surroundings appear safe. Stay alert and trust your instincts.",
-        "note": "Connect a vision AI API (Claude Vision / Google Vision) for real detection"
-    }
+
+    image_data = body.get("image", "")
+    mime_type = body.get("mime_type", "image/jpeg")
+    if not image_data:
+        return 400, {"error": "No image provided"}
+
+    # Strip data URL prefix if present (e.g. "data:image/jpeg;base64,...")
+    if image_data.startswith("data:"):
+        try:
+            header, image_data = image_data.split(",", 1)
+            mime_type = header.split(":")[1].split(";")[0]
+        except Exception:
+            pass
+
+    result = analyze_image_with_gemini(image_data, mime_type)
+    return 200, result
 
 # Chat (uses Claude API in production)
 @route("POST", "/api/chat")
